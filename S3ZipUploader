@@ -671,3 +671,168 @@ public class S3JsonUploader
         return endOfCentralDir;
     }
 }
+
+
+
+public class S3JsonUploader
+{
+    private readonly IAmazonS3 _s3Client;
+    private const int MultipartChunkSize = 5 * 1024 * 1024; // 5 MB
+
+    public S3JsonUploader(IAmazonS3 s3Client)
+    {
+        _s3Client = s3Client;
+    }
+
+    public async Task UploadJsonAsZip(string bucketName, string key, object jsonObject)
+    {
+        var initRequest = new InitiateMultipartUploadRequest
+        {
+            BucketName = bucketName,
+            Key = key
+        };
+        var initResponse = await _s3Client.InitiateMultipartUploadAsync(initRequest);
+
+        try
+        {
+            using var memoryStream = new MemoryStream();
+            using var zipStream = new MemoryStream();
+
+            var centralDirectoryOffset = memoryStream.Position;
+            var centralDirectory = new MemoryStream();
+
+            // 1. Write Local File Header
+            string fileName = "data.json";
+            var fileHeader = CreateLocalFileHeader(fileName);
+            await memoryStream.WriteAsync(fileHeader, 0, fileHeader.Length);
+
+            // 2. Write Compressed JSON Data
+            using (var deflateStream = new DeflateStream(memoryStream, CompressionLevel.Optimal, leaveOpen: true))
+            {
+                var json = System.Text.Json.JsonSerializer.Serialize(jsonObject);
+                var jsonData = Encoding.UTF8.GetBytes(json);
+                await deflateStream.WriteAsync(jsonData, 0, jsonData.Length);
+            }
+
+            // Calculate compressed size
+            var compressedSize = memoryStream.Position - centralDirectoryOffset;
+
+            // 3. Write Central Directory Entry
+            var centralDirectoryEntry = CreateCentralDirectoryEntry(fileName, centralDirectoryOffset, compressedSize, json.Length);
+            await centralDirectory.WriteAsync(centralDirectoryEntry, 0, centralDirectoryEntry.Length);
+
+            // 4. Write End of Central Directory
+            var endOfCentralDirectory = CreateEndOfCentralDirectory(1, centralDirectoryOffset, centralDirectory.Length);
+            await zipStream.WriteAsync(centralDirectory.ToArray());
+            await zipStream.WriteAsync(endOfCentralDirectory, 0, endOfCentralDirectory.Length);
+
+            // Upload to S3 in parts
+            var partNumber = 1;
+            var buffer = new byte[MultipartChunkSize];
+            int bytesRead;
+            memoryStream.Seek(0, SeekOrigin.Begin);
+            while ((bytesRead = await memoryStream.ReadAsync(buffer, 0, MultipartChunkSize)) > 0)
+            {
+                var uploadPartRequest = new UploadPartRequest
+                {
+                    BucketName = bucketName,
+                    Key = key,
+                    UploadId = initResponse.UploadId,
+                    PartNumber = partNumber++,
+                    InputStream = new MemoryStream(buffer, 0, bytesRead)
+                };
+                await _s3Client.UploadPartAsync(uploadPartRequest);
+            }
+
+            // Complete Multipart Upload
+            var completeRequest = new CompleteMultipartUploadRequest
+            {
+                BucketName = bucketName,
+                Key = key,
+                UploadId = initResponse.UploadId
+            };
+            await _s3Client.CompleteMultipartUploadAsync(completeRequest);
+        }
+        catch (Exception)
+        {
+            await _s3Client.AbortMultipartUploadAsync(new AbortMultipartUploadRequest
+            {
+                BucketName = bucketName,
+                Key = key,
+                UploadId = initResponse.UploadId
+            });
+            throw;
+        }
+    }
+
+    private byte[] CreateLocalFileHeader(string fileName)
+    {
+        var fileNameBytes = Encoding.UTF8.GetBytes(fileName);
+        var header = new byte[30 + fileNameBytes.Length];
+
+        // Local file header signature
+        Array.Copy(BitConverter.GetBytes(0x04034b50), 0, header, 0, 4);
+
+        // Version needed to extract
+        Array.Copy(BitConverter.GetBytes((ushort)20), 0, header, 4, 2);
+
+        // Compression method (8 = Deflate)
+        Array.Copy(BitConverter.GetBytes((ushort)8), 0, header, 8, 2);
+
+        // File name length
+        Array.Copy(BitConverter.GetBytes((ushort)fileNameBytes.Length), 0, header, 26, 2);
+
+        // File name
+        Array.Copy(fileNameBytes, 0, header, 30, fileNameBytes.Length);
+
+        return header;
+    }
+
+    private byte[] CreateCentralDirectoryEntry(string fileName, long offset, long compressedSize, long uncompressedSize)
+    {
+        var fileNameBytes = Encoding.UTF8.GetBytes(fileName);
+        var entry = new byte[46 + fileNameBytes.Length];
+
+        // Central directory file header signature
+        Array.Copy(BitConverter.GetBytes(0x02014b50), 0, entry, 0, 4);
+
+        // Version made by
+        Array.Copy(BitConverter.GetBytes((ushort)20), 0, entry, 4, 2);
+
+        // Compression method (8 = Deflate)
+        Array.Copy(BitConverter.GetBytes((ushort)8), 0, entry, 10, 2);
+
+        // Compressed size
+        Array.Copy(BitConverter.GetBytes((uint)compressedSize), 0, entry, 20, 4);
+
+        // File name length
+        Array.Copy(BitConverter.GetBytes((ushort)fileNameBytes.Length), 0, entry, 28, 2);
+
+        // Relative offset of local header
+        Array.Copy(BitConverter.GetBytes((uint)offset), 0, entry, 42, 4);
+
+        // File name
+        Array.Copy(fileNameBytes, 0, entry, 46, fileNameBytes.Length);
+
+        return entry;
+    }
+
+    private byte[] CreateEndOfCentralDirectory(int fileCount, long centralDirectoryOffset, long centralDirectorySize)
+    {
+        var endOfCentralDir = new byte[22];
+
+        // End of central directory signature
+        Array.Copy(BitConverter.GetBytes(0x06054b50), 0, endOfCentralDir, 0, 4);
+
+        // Total number of central directory records
+        Array.Copy(BitConverter.GetBytes((ushort)fileCount), 0, endOfCentralDir, 10, 2);
+
+        // Size of the central directory
+        Array.Copy(BitConverter.GetBytes((uint)centralDirectorySize), 0, endOfCentralDir, 12, 4);
+
+        // Offset of start of central directory
+        Array.Copy(BitConverter.GetBytes((uint)centralDirectoryOffset), 0, endOfCentralDir, 16, 4);
+
+        return endOfCentralDir;
+    }
+}
