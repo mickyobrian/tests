@@ -31,15 +31,17 @@ public class S3ZipUploader
             using var uploadStream = new MemoryStream(); // Buffer for multipart uploads
             foreach (var (fileName, fileContent) in files)
             {
+                uint crc32 = CalculateCrc32(fileContent);
+
                 // Write Local File Header
-                var localFileHeader = CreateLocalFileHeader(fileName, fileContent.Length, totalBytesWritten);
+                var localFileHeader = CreateLocalFileHeader(fileName, fileContent.Length, crc32);
                 uploadStream.Write(localFileHeader, 0, localFileHeader.Length);
 
                 // Write File Content
                 uploadStream.Write(fileContent, 0, fileContent.Length);
 
                 // Add to Central Directory
-                var centralDirectoryEntry = CreateCentralDirectoryEntry(fileName, fileContent.Length, totalBytesWritten);
+                var centralDirectoryEntry = CreateCentralDirectoryEntry(fileName, fileContent.Length, crc32, totalBytesWritten);
                 centralDirectory.Add(centralDirectoryEntry);
 
                 totalBytesWritten += localFileHeader.Length + fileContent.Length;
@@ -52,7 +54,7 @@ public class S3ZipUploader
             }
 
             // Write Central Directory and End of Central Directory Record
-            var centralDirectoryBytes = CombineCentralDirectory(centralDirectory);
+            var centralDirectoryBytes = CombineCentralDirectory(centralDirectory, totalBytesWritten);
             uploadStream.Write(centralDirectoryBytes, 0, centralDirectoryBytes.Length);
 
             if (uploadStream.Length > 0)
@@ -104,7 +106,14 @@ public class S3ZipUploader
         uploadStream.SetLength(0); // Clear the buffer for the next part
     }
 
-    private byte[] CreateLocalFileHeader(string fileName, int fileSize, long offset)
+    private uint CalculateCrc32(byte[] data)
+    {
+        using var crc32 = new System.IO.Hashing.Crc32();
+        crc32.Append(data);
+        return BitConverter.ToUInt32(crc32.GetCurrentHash(), 0);
+    }
+
+    private byte[] CreateLocalFileHeader(string fileName, int fileSize, uint crc32)
     {
         using var headerStream = new MemoryStream();
         using var writer = new BinaryWriter(headerStream);
@@ -114,7 +123,7 @@ public class S3ZipUploader
         writer.Write((short)0); // General purpose bit flag
         writer.Write((short)0); // Compression method (0 = store, no compression)
         writer.Write((int)DateTimeToDosTime(DateTime.Now)); // File last modification time
-        writer.Write(0); // CRC-32 (not needed for uncompressed files)
+        writer.Write(crc32); // CRC-32
         writer.Write(fileSize); // Compressed size
         writer.Write(fileSize); // Uncompressed size
         writer.Write((short)fileName.Length); // File name length
@@ -125,7 +134,7 @@ public class S3ZipUploader
         return headerStream.ToArray();
     }
 
-    private byte[] CreateCentralDirectoryEntry(string fileName, int fileSize, long offset)
+    private byte[] CreateCentralDirectoryEntry(string fileName, int fileSize, uint crc32, long offset)
     {
         using var directoryStream = new MemoryStream();
         using var writer = new BinaryWriter(directoryStream);
@@ -136,7 +145,7 @@ public class S3ZipUploader
         writer.Write((short)0); // General purpose bit flag
         writer.Write((short)0); // Compression method
         writer.Write((int)DateTimeToDosTime(DateTime.Now)); // File last modification time
-        writer.Write(0); // CRC-32
+        writer.Write(crc32); // CRC-32
         writer.Write(fileSize); // Compressed size
         writer.Write(fileSize); // Uncompressed size
         writer.Write((short)fileName.Length); // File name length
@@ -152,7 +161,7 @@ public class S3ZipUploader
         return directoryStream.ToArray();
     }
 
-    private byte[] CombineCentralDirectory(List<byte[]> centralDirectoryEntries)
+    private byte[] CombineCentralDirectory(List<byte[]> centralDirectoryEntries, long centralDirectoryOffset)
     {
         using var centralStream = new MemoryStream();
         foreach (var entry in centralDirectoryEntries)
@@ -168,7 +177,7 @@ public class S3ZipUploader
         writer.Write((short)centralDirectoryEntries.Count); // Number of central directory records on this disk
         writer.Write((short)centralDirectoryEntries.Count); // Total number of central directory records
         writer.Write((int)centralStream.Length); // Size of central directory
-        writer.Write((int)0); // Offset of central directory
+        writer.Write((int)centralDirectoryOffset); // Offset of start of central directory
         writer.Write((short)0); // Comment length
 
         return centralStream.ToArray();
