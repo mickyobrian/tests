@@ -1,0 +1,186 @@
+using Amazon.S3;
+using Amazon.S3.Model;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+
+public class S3ZipUploader
+{
+    private const int ChunkSize = 5 * 1024 * 1024; // S3 minimum part size
+
+    public async Task StreamZipToS3Async(List<(string FileName, byte[] FileContent)> files, string bucketName, string keyName)
+    {
+        using var s3Client = new AmazonS3Client();
+        var initiateRequest = new InitiateMultipartUploadRequest
+        {
+            BucketName = bucketName,
+            Key = keyName
+        };
+
+        var initiateResponse = await s3Client.InitiateMultipartUploadAsync(initiateRequest);
+        var partETags = new List<PartETag>();
+        int partNumber = 1;
+
+        var centralDirectory = new List<byte[]>();
+        long totalBytesWritten = 0;
+
+        try
+        {
+            using var uploadStream = new MemoryStream(); // Buffer for multipart uploads
+            foreach (var (fileName, fileContent) in files)
+            {
+                // Write Local File Header
+                var localFileHeader = CreateLocalFileHeader(fileName, fileContent.Length, totalBytesWritten);
+                uploadStream.Write(localFileHeader, 0, localFileHeader.Length);
+
+                // Write File Content
+                uploadStream.Write(fileContent, 0, fileContent.Length);
+
+                // Add to Central Directory
+                var centralDirectoryEntry = CreateCentralDirectoryEntry(fileName, fileContent.Length, totalBytesWritten);
+                centralDirectory.Add(centralDirectoryEntry);
+
+                totalBytesWritten += localFileHeader.Length + fileContent.Length;
+
+                // Upload chunk if necessary
+                if (uploadStream.Length >= ChunkSize)
+                {
+                    await UploadChunkAsync(s3Client, initiateResponse, uploadStream, partETags, partNumber++);
+                }
+            }
+
+            // Write Central Directory and End of Central Directory Record
+            var centralDirectoryBytes = CombineCentralDirectory(centralDirectory);
+            uploadStream.Write(centralDirectoryBytes, 0, centralDirectoryBytes.Length);
+
+            if (uploadStream.Length > 0)
+            {
+                await UploadChunkAsync(s3Client, initiateResponse, uploadStream, partETags, partNumber++);
+            }
+        }
+        catch
+        {
+            // Abort multipart upload on error
+            var abortRequest = new AbortMultipartUploadRequest
+            {
+                BucketName = bucketName,
+                Key = keyName,
+                UploadId = initiateResponse.UploadId
+            };
+            await s3Client.AbortMultipartUploadAsync(abortRequest);
+            throw;
+        }
+
+        // Complete the multipart upload
+        var completeRequest = new CompleteMultipartUploadRequest
+        {
+            BucketName = bucketName,
+            Key = keyName,
+            UploadId = initiateResponse.UploadId,
+            PartETags = partETags
+        };
+        await s3Client.CompleteMultipartUploadAsync(completeRequest);
+    }
+
+    private async Task UploadChunkAsync(IAmazonS3 s3Client, InitiateMultipartUploadResponse initiateResponse, MemoryStream uploadStream, List<PartETag> partETags, int partNumber)
+    {
+        uploadStream.Position = 0;
+
+        var uploadPartRequest = new UploadPartRequest
+        {
+            BucketName = initiateResponse.BucketName,
+            Key = initiateResponse.Key,
+            UploadId = initiateResponse.UploadId,
+            PartNumber = partNumber,
+            InputStream = uploadStream,
+            PartSize = uploadStream.Length
+        };
+
+        var uploadPartResponse = await s3Client.UploadPartAsync(uploadPartRequest);
+        partETags.Add(new PartETag(uploadPartResponse.PartNumber, uploadPartResponse.ETag));
+
+        uploadStream.SetLength(0); // Clear the buffer for the next part
+    }
+
+    private byte[] CreateLocalFileHeader(string fileName, int fileSize, long offset)
+    {
+        using var headerStream = new MemoryStream();
+        using var writer = new BinaryWriter(headerStream);
+
+        writer.Write(0x04034b50); // Local file header signature
+        writer.Write((short)20); // Version needed to extract
+        writer.Write((short)0); // General purpose bit flag
+        writer.Write((short)0); // Compression method (0 = store, no compression)
+        writer.Write((int)DateTimeToDosTime(DateTime.Now)); // File last modification time
+        writer.Write(0); // CRC-32 (not needed for uncompressed files)
+        writer.Write(fileSize); // Compressed size
+        writer.Write(fileSize); // Uncompressed size
+        writer.Write((short)fileName.Length); // File name length
+        writer.Write((short)0); // Extra field length
+
+        writer.Write(Encoding.UTF8.GetBytes(fileName)); // File name
+
+        return headerStream.ToArray();
+    }
+
+    private byte[] CreateCentralDirectoryEntry(string fileName, int fileSize, long offset)
+    {
+        using var directoryStream = new MemoryStream();
+        using var writer = new BinaryWriter(directoryStream);
+
+        writer.Write(0x02014b50); // Central directory file header signature
+        writer.Write((short)20); // Version made by
+        writer.Write((short)20); // Version needed to extract
+        writer.Write((short)0); // General purpose bit flag
+        writer.Write((short)0); // Compression method
+        writer.Write((int)DateTimeToDosTime(DateTime.Now)); // File last modification time
+        writer.Write(0); // CRC-32
+        writer.Write(fileSize); // Compressed size
+        writer.Write(fileSize); // Uncompressed size
+        writer.Write((short)fileName.Length); // File name length
+        writer.Write((short)0); // Extra field length
+        writer.Write((short)0); // File comment length
+        writer.Write((short)0); // Disk number start
+        writer.Write((short)0); // Internal file attributes
+        writer.Write(0); // External file attributes
+        writer.Write((int)offset); // Relative offset of local file header
+
+        writer.Write(Encoding.UTF8.GetBytes(fileName)); // File name
+
+        return directoryStream.ToArray();
+    }
+
+    private byte[] CombineCentralDirectory(List<byte[]> centralDirectoryEntries)
+    {
+        using var centralStream = new MemoryStream();
+        foreach (var entry in centralDirectoryEntries)
+        {
+            centralStream.Write(entry, 0, entry.Length);
+        }
+
+        // Write end of central directory record
+        using var writer = new BinaryWriter(centralStream);
+        writer.Write(0x06054b50); // End of central directory signature
+        writer.Write((short)0); // Number of this disk
+        writer.Write((short)0); // Disk where central directory starts
+        writer.Write((short)centralDirectoryEntries.Count); // Number of central directory records on this disk
+        writer.Write((short)centralDirectoryEntries.Count); // Total number of central directory records
+        writer.Write((int)centralStream.Length); // Size of central directory
+        writer.Write((int)0); // Offset of central directory
+        writer.Write((short)0); // Comment length
+
+        return centralStream.ToArray();
+    }
+
+    private int DateTimeToDosTime(DateTime dateTime)
+    {
+        return ((dateTime.Year - 1980) << 25) |
+               (dateTime.Month << 21) |
+               (dateTime.Day << 16) |
+               (dateTime.Hour << 11) |
+               (dateTime.Minute << 5) |
+               (dateTime.Second >> 1);
+    }
+}
