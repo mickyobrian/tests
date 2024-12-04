@@ -791,3 +791,131 @@ public class IncrementalUploader
         await _s3Client.CompleteMultipartUploadAsync(completeRequest);
     }
 }
+
+public class IncrementalUploader
+{
+    private const int PartSize = 5 * 1024 * 1024; // Minimum 5 MB for S3
+
+    private readonly AmazonS3Client _s3Client;
+    private readonly string _bucketName;
+
+    public IncrementalUploader(AmazonS3Client s3Client, string bucketName)
+    {
+        _s3Client = s3Client;
+        _bucketName = bucketName;
+    }
+
+    public async Task UploadObjectAsJsonZipAsync<T>(T largeObject, string key)
+    {
+        var initiateRequest = new InitiateMultipartUploadRequest
+        {
+            BucketName = _bucketName,
+            Key = key
+        };
+        var initiateResponse = await _s3Client.InitiateMultipartUploadAsync(initiateRequest);
+        var uploadId = initiateResponse.UploadId;
+
+        try
+        {
+            using (var memoryStream = new MemoryStream())
+            using (var deflateStream = new DeflateStream(memoryStream, CompressionLevel.Optimal, leaveOpen: true))
+            using (var jsonWriter = new Utf8JsonWriter(deflateStream))
+            {
+                int partNumber = 1;
+                var partETags = new List<PartETag>();
+
+                // Begin JSON array
+                jsonWriter.WriteStartArray();
+
+                foreach (var item in SerializeInChunks(largeObject))
+                {
+                    // Serialize each item
+                    jsonWriter.WriteStartObject();
+                    foreach (var property in item)
+                    {
+                        jsonWriter.WritePropertyName(property.Key);
+                        jsonWriter.WriteStringValue(property.Value);
+                    }
+                    jsonWriter.WriteEndObject();
+
+                    // Flush and check if memory stream exceeds part size
+                    jsonWriter.Flush();
+                    if (memoryStream.Length >= PartSize)
+                    {
+                        await UploadPartAsync(uploadId, key, partNumber++, memoryStream, partETags);
+                    }
+                }
+
+                // Close JSON array
+                jsonWriter.WriteEndArray();
+                jsonWriter.Flush();
+
+                // Upload any remaining data
+                if (memoryStream.Length > 0)
+                {
+                    await UploadPartAsync(uploadId, key, partNumber++, memoryStream, partETags);
+                }
+
+                // Complete multipart upload
+                await CompleteMultipartUploadAsync(uploadId, key, partETags);
+            }
+        }
+        catch
+        {
+            await _s3Client.AbortMultipartUploadAsync(new AbortMultipartUploadRequest
+            {
+                BucketName = _bucketName,
+                Key = key,
+                UploadId = uploadId
+            });
+            throw;
+        }
+    }
+
+    private IEnumerable<Dictionary<string, string>> SerializeInChunks<T>(T largeObject)
+    {
+        // Mock: Replace with actual serialization logic
+        // For example, if largeObject is a list, yield return each item as a dictionary.
+        foreach (var item in (IEnumerable)largeObject)
+        {
+            yield return new Dictionary<string, string>
+            {
+                { "key1", "value1" },
+                { "key2", "value2" }
+            };
+        }
+    }
+
+    private async Task UploadPartAsync(string uploadId, string key, int partNumber, MemoryStream memoryStream, List<PartETag> partETags)
+    {
+        memoryStream.Position = 0; // Reset memory stream for reading
+
+        var uploadPartRequest = new UploadPartRequest
+        {
+            BucketName = _bucketName,
+            Key = key,
+            UploadId = uploadId,
+            PartNumber = partNumber,
+            InputStream = memoryStream,
+            PartSize = memoryStream.Length
+        };
+
+        var response = await _s3Client.UploadPartAsync(uploadPartRequest);
+        partETags.Add(new PartETag(response.PartNumber, response.ETag));
+
+        memoryStream.SetLength(0); // Clear memory stream for next part
+    }
+
+    private async Task CompleteMultipartUploadAsync(string uploadId, string key, List<PartETag> partETags)
+    {
+        var completeRequest = new CompleteMultipartUploadRequest
+        {
+            BucketName = _bucketName,
+            Key = key,
+            UploadId = uploadId,
+            PartETags = partETags
+        };
+
+        await _s3Client.CompleteMultipartUploadAsync(completeRequest);
+    }
+}
